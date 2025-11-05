@@ -1,13 +1,23 @@
-
 import streamlit as st
 import pandas as pd
-import yfinance as yf
 import datetime as dt
 from pathlib import Path
 
+# yfinance is optional during import in case of cold env problems; we fail gracefully
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
 st.set_page_config(page_title="Private Portfolio Tracker", page_icon="📈", layout="wide")
 
-PASSCODE = st.secrets.get("passcode", None)
+# ------------------------ AUTH (single-user passcode) ------------------------
+PASSCODE = None
+try:
+    # Streamlit Cloud / local secrets.toml
+    PASSCODE = st.secrets.get("passcode", None)
+except Exception:
+    PASSCODE = None
 
 with st.sidebar:
     st.header("🔒 Sign In")
@@ -22,77 +32,106 @@ if code != PASSCODE:
     st.info("Enter the passcode to continue.")
     st.stop()
 
+# ------------------------ DATA PATHS & HELPERS ------------------------
 DATA_BAL = Path("data/balances.csv")
 DATA_HLD = Path("data/holdings.csv")
 DATA_BAL.parent.mkdir(parents=True, exist_ok=True)
 
+def load_csv(path: Path, required_cols: dict) -> pd.DataFrame:
+    """Load a CSV and ensure required columns exist with default values."""
+    if path.exists():
+        df = pd.read_csv(path)
+    else:
+        df = pd.DataFrame(columns=list(required_cols.keys()))
+    # add any missing cols with defaults
+    for c, default in required_cols.items():
+        if c not in df.columns:
+            df[c] = default
+    return df
+
+def save_csv(path: Path, df: pd.DataFrame):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+
+def _safe_to_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+# --- yfinance helpers (robust across versions) ---
 @st.cache_data(ttl=300)
 def fetch_quote(ticker: str):
+    if yf is None:
+        return None
     try:
         t = yf.Ticker(ticker)
-        px = None
+        # 1) try fast_info attr style
         try:
             fi = getattr(t, "fast_info", None)
-            if fi is not None and "lastPrice" in fi:
-                px = fi["lastPrice"]
+            # fast_info can be an object with attributes OR dict-like
+            if fi is not None:
+                # attribute style
+                if hasattr(fi, "last_price") and fi.last_price is not None:
+                    return float(fi.last_price)
+                # dict-like style
+                if isinstance(fi, dict) and ("lastPrice" in fi or "last_price" in fi):
+                    return float(fi.get("lastPrice", fi.get("last_price")))
         except Exception:
-            px = None
-        if px is None:
-            hist = t.history(period="1d")
-            if not hist.empty:
-                px = float(hist["Close"].iloc[-1])
-        return px
+            pass
+        # 2) last close
+        hist = t.history(period="1d")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+        # 3) info (slow; fallback only)
+        info = getattr(t, "info", {}) or {}
+        for k in ("regularMarketPrice", "currentPrice", "previousClose"):
+            if k in info and info[k] is not None:
+                return float(info[k])
     except Exception:
         return None
+    return None
 
 @st.cache_data(ttl=1800)
-def fetch_dividends(ticker: str):
+def fetch_dividends(ticker: str) -> pd.DataFrame:
+    if yf is None:
+        return pd.DataFrame(columns=["Date", "Dividend"])
     try:
         t = yf.Ticker(ticker)
         div = t.dividends
         if div is None or len(div) == 0:
-            return pd.DataFrame(columns=["Date","Dividend"])
-        df = div.reset_index()
-        df.columns = ["Date","Dividend"]
-        return df
+            return pd.DataFrame(columns=["Date", "Dividend"])
+        out = div.reset_index()
+        out.columns = ["Date", "Dividend"]
+        return out
     except Exception:
-        return pd.DataFrame(columns=["Date","Dividend"])
+        return pd.DataFrame(columns=["Date", "Dividend"])
 
-def load_csv(path: Path, cols):
-    if path.exists():
-        df = pd.read_csv(path)
-        for c, default in cols.items():
-            if c not in df.columns:
-                df[c] = default
-        return df
-    else:
-        return pd.DataFrame([{k:v for k,v in cols.items()}]).head(0)
+# ---------- Load data
+bal_required = {"month": "", "balance": 0.0, "contribution": 0.0, "note": ""}
+hld_required = {"ticker": "", "shares": 0.0, "cost_basis": 0.0, "note": ""}
 
-def save_csv(path: Path, df: pd.DataFrame):
-    df.to_csv(path, index=False)
+balances = load_csv(DATA_BAL, bal_required)
+holdings = load_csv(DATA_HLD, hld_required)
 
-bal_cols = {"month":"", "balance":0.0, "contribution":0.0, "note":""}
-hld_cols = {"ticker":"", "shares":0.0, "cost_basis":0.0, "note":""}
+# normalize types
+if len(balances):
+    balances["month"] = pd.to_datetime(balances["month"], errors="coerce").dt.date
+    balances["balance"] = pd.to_numeric(balances["balance"], errors="coerce").fillna(0.0)
+    balances["contribution"] = pd.to_numeric(balances["contribution"], errors="coerce").fillna(0.0)
 
-balances = load_csv(DATA_BAL, bal_cols)
-holdings = load_csv(DATA_HLD, hld_cols)
-
-if "month" in balances.columns and len(balances):
-    balances["month"] = pd.to_datetime(balances["month"]).dt.date
-for c in ["balance","contribution"]:
-    if c in balances.columns:
-        balances[c] = pd.to_numeric(balances[c], errors="coerce").fillna(0.0)
-
-for c in ["shares","cost_basis"]:
-    if c in holdings.columns:
-        holdings[c] = pd.to_numeric(holdings[c], errors="coerce").fillna(0.0)
-holdings["ticker"] = holdings["ticker"].astype(str).str.upper()
+if len(holdings):
+    holdings["ticker"] = holdings["ticker"].astype(str).str.upper().str.strip()
+    holdings["shares"] = pd.to_numeric(holdings["shares"], errors="coerce").fillna(0.0)
+    holdings["cost_basis"] = pd.to_numeric(holdings["cost_basis"], errors="coerce").fillna(0.0)
 
 st.title("📈 Private Portfolio Tracker")
 st.caption("Single-user passcode, monthly balance updates, equity holdings with live Yahoo Finance prices.")
 
+# ------------------------ TABS ------------------------
 tab_bal, tab_hld, tab_dash = st.tabs(["📅 Monthly Balance", "🧺 Holdings", "📊 Dashboard"])
 
+# ===== Monthly Balance Tab =====
 with tab_bal:
     st.subheader("➕ Add / Update Month")
     col1, col2 = st.columns(2)
@@ -106,28 +145,36 @@ with tab_bal:
         contrib = st.number_input("Contribution This Month ($)", value=0.0, step=25.0)
     with col4:
         note = st.text_input("Note", value="")
-    sync = st.checkbox("Sync balance from current holdings value", value=False)
+
+    sync = st.checkbox("Sync balance from current holdings value", value=False,
+                       help="Fetch latest prices for all holdings and use total value as the month balance.")
+
     if st.button("Save/Update Month", use_container_width=True):
-        if sync:
+        if sync and len(holdings):
             total = 0.0
             for _, r in holdings.iterrows():
-                if r["ticker"] and r["shares"] > 0:
-                    px = fetch_quote(r["ticker"])
-                    if px:
-                        total += float(px) * float(r["shares"])
+                tkr = (r.get("ticker") or "").strip()
+                sh = _safe_to_float(r.get("shares"), 0.0)
+                if tkr and sh > 0:
+                    px = fetch_quote(tkr)
+                    if px is not None:
+                        total += float(px) * sh
             balance = total
         m1 = month.replace(day=1)
-        if (len(balances) and (balances["month"] == m1).any()):
-            balances.loc[balances["month"] == m1, ["balance","contribution","note"]] = [balance, contrib, note]
+        if len(balances) and (balances["month"] == m1).any():
+            balances.loc[balances["month"] == m1, ["balance", "contribution", "note"]] = [balance, contrib, note]
         else:
-            balances = pd.concat([balances, pd.DataFrame([{"month": m1, "balance": balance, "contribution": contrib, "note": note}])], ignore_index=True)
+            balances = pd.concat(
+                [balances, pd.DataFrame([{"month": m1, "balance": balance, "contribution": contrib, "note": note}])],
+                ignore_index=True
+            )
         balances = balances.sort_values("month")
         save_csv(DATA_BAL, balances)
         st.success(f"Saved {m1.isoformat()} → ${balance:,.2f}")
 
     st.divider()
     st.subheader("History")
-    st.dataframe(balances.style.format({"balance":"${:,.2f}","contribution":"${:,.2f}"}), use_container_width=True)
+    st.dataframe(balances, use_container_width=True)
 
     if len(balances):
         chart_df = balances.copy()
@@ -135,78 +182,87 @@ with tab_bal:
         chart_df = chart_df.set_index("month")[["balance"]]
         st.line_chart(chart_df)
 
+# ===== Holdings Tab =====
 with tab_hld:
     st.subheader("Holdings")
+    st.caption("Add tickers, shares, and (optional) cost basis. Prices and dividends are fetched from Yahoo Finance.")
+
     with st.form("add_holding"):
-        c1, c2, c3, c4 = st.columns([2,1,1,2])
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
         tkr = c1.text_input("Ticker (e.g., AAPL, SPY)").upper().strip()
-        sh  = c2.number_input("Shares", min_value=0.0, value=0.0, step=1.0)
-        cb  = c3.number_input("Cost Basis ($/share)", min_value=0.0, value=0.0, step=1.0)
-        nt  = c4.text_input("Note")
+        sh = c2.number_input("Shares", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+        cb = c3.number_input("Cost Basis ($/share)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+        nt = c4.text_input("Note")
         submitted = st.form_submit_button("Add / Update")
+
     if submitted and tkr:
-        if (holdings["ticker"] == tkr).any():
-            holdings.loc[holdings["ticker"] == tkr, ["shares","cost_basis","note"]] = [sh, cb, nt]
+        if len(holdings) and (holdings["ticker"] == tkr).any():
+            holdings.loc[holdings["ticker"] == tkr, ["shares", "cost_basis", "note"]] = [sh, cb, nt]
         else:
-            holdings = pd.concat([holdings, pd.DataFrame([{"ticker": tkr, "shares": sh, "cost_basis": cb, "note": nt}])], ignore_index=True)
+            holdings = pd.concat([holdings, pd.DataFrame([{"ticker": tkr, "shares": sh, "cost_basis": cb, "note": nt}])],
+                                 ignore_index=True)
         save_csv(DATA_HLD, holdings)
         st.success(f"Saved {tkr}")
 
     if len(holdings):
+        # fetch prices safely
         prices = {}
         for t in holdings["ticker"].tolist():
             if t:
                 prices[t] = fetch_quote(t)
-        holdings_display = holdings.copy()
-        holdings_display["last_price"] = holdings_display["ticker"].map(prices)
-        holdings_display["market_value"] = (holdings_display["last_price"].fillna(0.0) * holdings_display["shares"]).round(2)
-        holdings_display["unrealized_pnl"] = ((holdings_display["last_price"].fillna(0.0) - holdings_display["cost_basis"]) * holdings_display["shares"]).round(2)
-        st.dataframe(
-            holdings_display.style.format({"shares":"{:,.2f}","cost_basis":"${:,.2f}","last_price":"${:,.2f}","market_value":"${:,.2f}","unrealized_pnl":"${:,.2f}"}),
-            use_container_width=True
-        )
 
-        total_val = float(holdings_display["market_value"].sum())
+        hd = holdings.copy()
+        hd["last_price"] = hd["ticker"].map(prices)
+        hd["market_value"] = (hd["last_price"].fillna(0.0) * hd["shares"]).round(2)
+        hd["unrealized_pnl"] = ((hd["last_price"].fillna(0.0) - hd["cost_basis"]) * hd["shares"]).round(2)
+        st.dataframe(hd, use_container_width=True)
+
+        total_val = float(hd["market_value"].sum())
         st.metric("Total Market Value", f"${total_val:,.2f}")
+
         if st.button("Use Total Market Value as This Month's Balance"):
             m1 = dt.date.today().replace(day=1)
-            if (len(balances) and (balances["month"] == m1).any()):
+            if len(balances) and (balances["month"] == m1).any():
                 balances.loc[balances["month"] == m1, "balance"] = total_val
             else:
-                balances = pd.concat([balances, pd.DataFrame([{"month": m1, "balance": total_val, "contribution": 0.0, "note": "Synced from holdings"}])], ignore_index=True)
+                balances = pd.concat([balances, pd.DataFrame([{
+                    "month": m1, "balance": total_val, "contribution": 0.0, "note": "Synced from holdings"
+                }])], ignore_index=True)
             balances = balances.sort_values("month")
             save_csv(DATA_BAL, balances)
             st.success(f"Updated {m1.isoformat()} to ${total_val:,.2f}")
 
         st.divider()
         st.subheader("Dividend Lookup")
-        t_sel = st.selectbox("Select ticker for dividend history", holdings["ticker"].tolist())
-        if t_sel:
-            divs = fetch_dividends(t_sel)
-            if divs.empty:
-                st.info("No dividend data returned.")
-            else:
-                st.dataframe(divs.tail(20), use_container_width=True)
+        t_opts = hd["ticker"].tolist()
+        if t_opts:
+            t_sel = st.selectbox("Select ticker for dividend history", t_opts)
+            if t_sel:
+                divs = fetch_dividends(t_sel)
+                if divs.empty:
+                    st.info("No dividend data returned.")
+                else:
+                    st.dataframe(divs.tail(20), use_container_width=True)
 
     st.divider()
     st.subheader("Delete a Holding")
     if len(holdings):
         del_t = st.selectbox("Choose ticker to delete", [""] + holdings["ticker"].tolist())
-        if st.button("Delete", disabled=(del_t==\"\")) and del_t:
+        if st.button("Delete", disabled=(del_t == "")) and del_t:
             holdings = holdings[holdings["ticker"] != del_t]
             save_csv(DATA_HLD, holdings)
             st.warning(f"Deleted {del_t}")
 
+# ===== Dashboard Tab =====
 with tab_dash:
     st.subheader("Overview")
+    total_value = 0.0
     if len(holdings):
         prices = {t: fetch_quote(t) for t in holdings["ticker"].tolist()}
-        holdings_eval = holdings.copy()
-        holdings_eval["last_price"] = holdings_eval["ticker"].map(prices)
-        holdings_eval["market_value"] = holdings_eval["last_price"].fillna(0.0) * holdings_eval["shares"]
-        total_value = float(holdings_eval["market_value"].sum())
-    else:
-        total_value = 0.0
+        he = holdings.copy()
+        he["last_price"] = he["ticker"].map(prices)
+        he["market_value"] = he["last_price"].fillna(0.0) * he["shares"]
+        total_value = float(he["market_value"].sum())
 
     net_contrib = float(balances["contribution"].sum()) if len(balances) else 0.0
     current_balance = float(balances["balance"].iloc[-1]) if len(balances) else total_value
