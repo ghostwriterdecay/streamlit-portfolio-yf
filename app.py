@@ -195,14 +195,34 @@ with tab_hld:
         nt = c4.text_input("Note")
         submitted = st.form_submit_button("Add / Update")
 
-    if submitted and tkr:
-        if len(holdings) and (holdings["ticker"] == tkr).any():
-            holdings.loc[holdings["ticker"] == tkr, ["shares", "cost_basis", "note"]] = [sh, cb, nt]
-        else:
-            holdings = pd.concat([holdings, pd.DataFrame([{"ticker": tkr, "shares": sh, "cost_basis": cb, "note": nt}])],
-                                 ignore_index=True)
-        save_csv(DATA_HLD, holdings)
-        st.success(f"Saved {tkr}")
+if submitted and tkr:
+    sh = float(sh) if sh not in [None, ""] else 0.0
+    cb = float(cb) if cb not in [None, ""] else 0.0
+    nt = nt if nt is not None else ""
+
+    if len(holdings) and (holdings["ticker"] == tkr).any():
+        idx = holdings.index[holdings["ticker"] == tkr][0]
+        holdings.at[idx, "shares"] = sh
+        holdings.at[idx, "cost_basis"] = cb
+        holdings.at[idx, "note"] = nt
+    else:
+        holdings = pd.concat(
+            [
+                holdings,
+                pd.DataFrame(
+                    [{
+                        "ticker": tkr,
+                        "shares": sh,
+                        "cost_basis": cb,
+                        "note": nt
+                    }]
+                )
+            ],
+            ignore_index=True
+        )
+
+    save_csv(DATA_HLD, holdings)
+    st.success(f"Saved {tkr}")
 
     if len(holdings):
         # fetch prices safely
